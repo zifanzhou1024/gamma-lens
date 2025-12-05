@@ -4,20 +4,28 @@ import numpy as np
 import scipy.stats as si
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import matplotlib.patches as patches
 import seaborn as sns
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- CONFIGURATION ---
-TICKER_SYMBOL = 'US.SPY'
+# ==========================================
+# [USER INPUT] CHANGE TICKER HERE
+# ==========================================
+TARGET_STOCK = "TSLA"  # <--- Just type the symbol here (e.g. "NVDA", "AMD", "SPY")
+
+# Automatic Formatting
+MOOMOO_SYMBOL = f"US.{TARGET_STOCK}"  # Becomes "US.TSLA"
+YAHOO_SYMBOL = TARGET_STOCK  # Becomes "TSLA"
+
+# System Config
 HOST = '172.22.48.1'  # Your WSL Bridge IP
 PORT = 11111
 NUM_EXPIRATIONS = 5
 STRIKES_TO_SHOW = 30
 RISK_FREE_RATE = 0.045
+PLOT_THEME = 'dark_background'
 
-plt.style.use('dark_background')
+plt.style.use(PLOT_THEME)
 
 # --- COLORS ---
 colors = [
@@ -38,14 +46,22 @@ def black_scholes_gamma(S, K, T, r, sigma):
         return 0.0
 
 
-def get_spot_price_fallback():
-    """Fetches SPY price from Yahoo if Moomoo fails."""
+def get_spot_price_fallback(symbol):
+    """Fetches price from Yahoo using the DYNAMIC symbol."""
     try:
-        print("--- Fetching Spot Price via Yahoo Finance... ---")
-        ticker = yf.Ticker("SPY")
-        price = ticker.fast_info['last_price']
+        print(f"--- Fetching Spot Price for {symbol} via Yahoo Finance... ---")
+        ticker = yf.Ticker(symbol)
+
+        # Try fast_info first, fall back to history
+        try:
+            price = ticker.fast_info['last_price']
+        except:
+            hist = ticker.history(period="1d")
+            price = hist['Close'].iloc[-1]
+
         return price
-    except:
+    except Exception as e:
+        print(f"Yahoo Fallback Failed: {e}")
         return None
 
 
@@ -54,29 +70,31 @@ def get_moomoo_data():
 
     quote_ctx = OpenQuoteContext(host=HOST, port=PORT)
 
-    # 1. GET SPOT PRICE (With Fallback)
+    # 1. GET SPOT PRICE (With Dynamic Fallback)
     spot_price = 0.0
-    ret, data = quote_ctx.get_market_snapshot([TICKER_SYMBOL])
+    ret, data = quote_ctx.get_market_snapshot([MOOMOO_SYMBOL])
 
-    if ret == RET_OK:
+    # Check if Moomoo gave us a valid price (ret OK and price > 0)
+    if ret == RET_OK and data['last_price'][0] > 0:
         spot_price = data['last_price'][0]
-        print(f"--- Moomoo Spot Price: ${spot_price:.2f} ---")
+        print(f"--- Moomoo Spot Price ({MOOMOO_SYMBOL}): ${spot_price:.2f} ---")
     else:
-        print(f"Moomoo Spot Failed: {data}")
-        # FALLBACK TO YAHOO
-        spot_price = get_spot_price_fallback()
+        print(f"Moomoo Spot Unavailable (Permission Denied).")
+        # FALLBACK TO YAHOO using the correct symbol
+        spot_price = get_spot_price_fallback(YAHOO_SYMBOL)
+
         if spot_price:
-            print(f"--- Yahoo Spot Price: ${spot_price:.2f} ---")
+            print(f"--- Yahoo Spot Price ({YAHOO_SYMBOL}): ${spot_price:.2f} ---")
         else:
-            print("CRITICAL: Could not get Spot Price from Moomoo OR Yahoo.")
+            print("CRITICAL: Could not get Spot Price.")
             try:
-                spot_price = float(input("Please enter current SPY price manually: "))
+                spot_price = float(input(f"Please enter current {TARGET_STOCK} price manually: "))
             except:
                 quote_ctx.close();
                 return None, None
 
     # 2. GET DATES
-    ret, dates_data = quote_ctx.get_option_expiration_date(code=TICKER_SYMBOL)
+    ret, dates_data = quote_ctx.get_option_expiration_date(code=MOOMOO_SYMBOL)
     if ret != RET_OK:
         print(f"Error fetching dates: {dates_data}")
         quote_ctx.close();
@@ -95,7 +113,7 @@ def get_moomoo_data():
         print(f"Fetching {expiry}...", end=" ")
 
         # Get Chain structure
-        ret, chain_info = quote_ctx.get_option_chain(code=TICKER_SYMBOL, start=expiry, end=expiry)
+        ret, chain_info = quote_ctx.get_option_chain(code=MOOMOO_SYMBOL, start=expiry, end=expiry)
         if ret != RET_OK:
             print("Failed (Chain Error).")
             continue
@@ -123,7 +141,6 @@ def get_moomoo_data():
 
         # Check if API failed (returns all zeros)
         if merged_df['gamma'].sum() == 0:
-            # Prepare Inputs for Local Calculation
             today = datetime.now().date()
             exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
             days_to_exp = (exp_date - today).days
@@ -151,7 +168,7 @@ def get_moomoo_data():
 
     quote_ctx.close()
 
-    # --- CRITICAL FIX: ignore_index=True ensures unique row numbers ---
+    # --- CRITICAL FIX: ignore_index=True ---
     if not all_dfs:
         return None, spot_price
 
@@ -162,7 +179,7 @@ def get_moomoo_data():
 def process_and_plot(df, spot_price):
     if df is None or df.empty: return
 
-    # --- SAFETY RESET ---
+    # Safety Reset
     df = df.reset_index(drop=True)
 
     # Normalize Columns
@@ -173,8 +190,6 @@ def process_and_plot(df, spot_price):
 
     # Flip signs for Puts
     mask_put = df['option_type'].astype(str).str.upper() == 'PUT'
-
-    # Using specific indexer to avoid ambiguity
     df.loc[mask_put, 'GEX_K'] = -df.loc[mask_put, 'GEX_K']
 
     # Filter & Pivot
@@ -200,10 +215,13 @@ def process_and_plot(df, spot_price):
     sns.heatmap(pivot_df, annot=annot_df, fmt="", cmap=custom_cmap, center=0,
                 linewidths=0.5, linecolor='#111111', ax=ax)
 
-    ax.set_title(f"{TICKER_SYMBOL} Gamma Walls (Spot: ${spot_price:.2f})", fontsize=16, fontweight='bold')
+    ax.set_title(f"{TARGET_STOCK} Gamma Walls (Spot: ${spot_price:.2f})", fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig("moomoo_gex_combined.png", dpi=300)
-    print("Success! Chart saved to 'moomoo_gex_combined.png'")
+
+    # Dynamic Filename
+    filename = f"{TARGET_STOCK}_gex_heatmap.png"
+    plt.savefig(filename, dpi=300)
+    print(f"Success! Chart saved to '{filename}'")
 
 
 if __name__ == "__main__":
