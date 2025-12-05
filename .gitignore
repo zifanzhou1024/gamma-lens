@@ -209,3 +209,4 @@ __marimo__/
 # JetBrains IDEs
 .idea/
 *.iml
+*.png
